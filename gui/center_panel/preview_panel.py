@@ -31,12 +31,28 @@ class PreviewPanel(QWidget):
             "1:1 (Square)": (1080, 1080), 
             "4:5 (IG Feed)": (1080, 1350)
         }
+        
         self.ratio_cb.addItems(self.ratios.keys())
         self.ratio_cb.currentTextChanged.connect(self.change_ratio)
         
         top_bar.addWidget(QLabel("Ratio:"))
         top_bar.addWidget(self.ratio_cb)
         top_bar.addStretch()
+        
+        # --- [FIX] TOOLBAR DEFINITION ---
+        toolbar = QHBoxLayout() # <--- INI BARIS YANG TADI HILANG
+        
+        # Tombol Text Biasa
+        self.btn_add_text = QPushButton("Add Text")
+        self.btn_add_text.setStyleSheet("background-color: #23272e; color: white; border: 1px solid #5c6370; padding: 4px;")
+        
+        # Tombol Paragraf
+        self.btn_add_para = QPushButton("Add Paragraph")
+        self.btn_add_para.setStyleSheet("background-color: #23272e; color: #98c379; border: 1px solid #98c379; padding: 4px;")
+        
+        toolbar.addWidget(self.btn_add_text)
+        toolbar.addWidget(self.btn_add_para)
+        toolbar.addStretch()
         
         # 2. Area Preview
         self.scene = QGraphicsScene()
@@ -63,6 +79,7 @@ class PreviewPanel(QWidget):
         
         # Add to Layout
         self.main_layout.addLayout(top_bar)
+        self.main_layout.addLayout(toolbar) # Masukkan Toolbar
         self.main_layout.addWidget(self.view)
         self.main_layout.addLayout(control_layout)
 

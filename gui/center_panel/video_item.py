@@ -1,10 +1,12 @@
 import os
+import math
 from PySide6.QtGui import (QImage, QPixmap, QColor, QBrush, QPen, QFont, 
-                           QPainter, QTextOption, QPainterPath, QFontMetrics, QRadialGradient)
-from PySide6.QtWidgets import QGraphicsRectItem, QGraphicsItem, QGraphicsBlurEffect
-from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF
-
-# Import PyAVClip jika tersedia, jika tidak sediakan placeholder agar tidak crash
+                           QPainter, QTextOption, QPainterPath, QFontMetrics, 
+                           QRadialGradient, QLinearGradient, QTransform)
+from PySide6.QtWidgets import QGraphicsRectItem, QGraphicsItem, QGraphicsBlurEffect, QGraphicsPixmapItem
+from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, Signal
+from PySide6.QtCore import Qt, QObject, Signal
+# Import PyAVClip jika tersedia
 try:
     from engine.pyav_engine import PyAVClip
 except ImportError:
@@ -13,90 +15,115 @@ except ImportError:
 class VideoItem(QGraphicsRectItem):
     """
     Item utama untuk Media (Video/Gambar) dan Teks pada Canvas.
-    Mendukung seleksi, resizing manual, dan sinkronisasi settings ke UI.
     """
     HANDLE_SIZE = 12
+    # --- DEFINISI HANDLES ---
     Handles = {
-        "TL": 0, "T": 1, "TR": 2, "L": 3, "R": 4,
-        "BL": 5, "B": 6, "BR": 7, "NONE": -1
+        "NONE": 0, "TL": 1, "TM": 2, "TR": 3,
+        "ML": 4, "MR": 5, "BL": 6, "BM": 7, "BR": 8
     }
 
     def __init__(self, name, file_path=None, parent=None, shape="portrait"):
-        # Default Dimensions berdasarkan Shape
+        # Default Dimensions
         w, h = 540, 960
         if shape == "landscape": w, h = 960, 540 
         elif shape == "square": w, h = 720, 720
-        elif shape == "text": w, h = 400, 200 
-
+        
         super().__init__(0, 0, w, h, parent)
         
-        self.name = name 
+        self.setAcceptHoverEvents(True)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+
+        self.name = name
         self.file_path = file_path
-        self.current_pixmap = None 
-        self.clip = None      
-            
-        # [BARU] Atribut Waktu (Start & End)
-        self.start_time = 0.0
-        self.end_time = 5.0  # Default 5 detik awal
-        self.source_duration = 0.0 # Durasi asli file sumber
         
-        # [BARU] Status apakah layer sedang dalam rentang waktu tayang
-        self.is_in_time_range = True
-
-        self.current_handle = self.Handles["NONE"]
+        # --- INISIALISASI VARIABEL STATE (PENTING) ---
         self.is_resizing = False
-        self.resize_start_pos = QPointF()
-        self.resize_start_rect = QRectF()
-        
+        self.current_handle = self.Handles["NONE"]
+        self.resize_start_pos = None
+        self.resize_start_rect = None
         self.is_drop_target = False
-
-        # Status Resizing
-        self.current_handle = self.Handles["NONE"]
-        self.is_resizing = False
-        self.resize_start_pos = QPointF()
-        self.resize_start_rect = QRectF()
-
-        # --- DICTIONARY SETTINGS (Sumber data utama untuk Controller) ---
+        self.is_in_time_range = True
+        
+        # Safety fallback (jika ada kode nyasar memanggil ini)
+        self._is_dragging = False 
+        
+        self.start_time = 0.0
+        self.end_time = 5.0
+        self.source_duration = 0.0
+        
         self.settings = {
             "x": 0, "y": 0, 
             "frame_w": int(w), "frame_h": int(h), "frame_rot": 0, 
             "lock": False,
             "scale": 100, 
-            "rot": 0,           # Rotasi konten di dalam frame
+            "rot": 0,
             "opacity": 100,
+            "sf_l": 0, "sf_r": 0, 
+            "f_l": 0, "f_r": 0, "f_t": 0, "f_b": 0, # Feather 4 Sisi
             "shape": shape, 
-            "content_type": "media",
-            
-            # [BARU] Simpan info waktu ke settings agar bisa dirender/disave
+            "content_type": "media", # Default
             "start_time": self.start_time,
             "end_time": self.end_time,
-            
-            "is_paragraph": False, "text_content": "Teks Baru", "font": "Arial", "font_size": 60,
-            "text_color": "#ffffff", "bg_on": False, "bg_color": "#000000",
-            "stroke_on": False, "stroke_width": 2, "stroke_color": "#000000",
-            "shadow_on": False, "shadow_color": "#555555",
-            "alignment": "center"
+            "chroma_key": "#00ff00",
+            "similarity": 100, "smoothness": 10,
+            "spill_r": 0, "spill_g": 0, "spill_b": 0
         }
-        
-        # Konfigurasi Interaksi
-        self.setFlags(QGraphicsRectItem.ItemIsMovable | 
-                      QGraphicsRectItem.ItemIsSelectable | 
-                      QGraphicsRectItem.ItemSendsGeometryChanges)
-        self.setAcceptHoverEvents(True) 
-        self.setZValue(1)
-        self.setTransformOriginPoint(self.rect().center())
-        
-        if file_path: 
-            self.set_content(file_path)
 
-    # --- SINKRONISASI GEOMETRI ---
+        self.current_pixmap = None 
+        self.clip = None
+
+        # --- LOGIKA IDENTIFIKASI KONTEN (PATCH APPLIED) ---
+        # 1. Cek Media (Video/Image)
+        if file_path and (file_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')) or 
+                          file_path.lower().endswith(('.jpg', '.png', '.jpeg', '.webp', '.bmp'))):
+            self.settings["content_type"] = "media"
+            
+            # Logic load clip (dari kode asli)
+            if PyAVClip:
+                try:
+                    self.clip = PyAVClip(file_path)
+                    self.end_time = self.clip.duration
+                    self.settings["end_time"] = self.end_time
+                    self.source_duration = self.clip.duration
+                except Exception as e:
+                    print(f"[VideoItem] Error loading clip: {e}")
+
+        # 2. Cek Text Layer biasa
+        elif name.startswith("Text Layer"):
+            self.settings["content_type"] = "text"
+            self.settings["text_content"] = "New Text"
+            self._update_text_pixmap()
+            
+        # 3. [BARU] Identifikasi Layer Caption Dummy
+        elif name == "CAPTION_LAYER":
+            self.settings["content_type"] = "caption_preview"
+            self.settings["text_content"] = "CAPTION PREVIEW AREA"
+            self.settings["lock"] = False # Harus bisa didrag
+            self.settings["is_bg"] = False
+            self.settings["font_size"] = 40
+            self.settings["text_color"] = "#ffffff"
+            self._update_text_pixmap()
+
+    def _update_text_pixmap(self):
+        # Fallback render sederhana untuk inisialisasi awal
+        pm = QPixmap(1000, 200)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setPen(Qt.white)
+        font = QFont("Arial", 60, QFont.Bold)
+        p.setFont(font)
+        p.drawText(pm.rect(), Qt.AlignCenter, self.settings.get("text_content", "Text"))
+        p.end()
+        self.current_pixmap = pm 
+   
+
     def itemChange(self, change, value):
-        """Otomatis update koordinat di settings saat item digeser di canvas"""
-        if change == QGraphicsItem.ItemPositionHasChanged:
-            self.settings["x"] = int(self.pos().x())
-            self.settings["y"] = int(self.pos().y())
-        if change == QGraphicsItem.ItemRotationHasChanged:
-            self.settings["frame_rot"] = int(self.rotation())
+        if change == QGraphicsItem.ItemPositionChange:
+            self.settings["x"] = value.x()
+            self.settings["y"] = value.y()
         return super().itemChange(change, value)
 
     # --- LOGIKA RENDERING (VISIBILITY) ---
@@ -109,73 +136,140 @@ class VideoItem(QGraphicsRectItem):
         if not should_draw_content and not is_selected:
             return 
 
-        painter.save()
+        # Simpan state painter utama
+        painter.save() 
         painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         
-        # 2. GAMBAR KONTEN (HANYA JIKA DALAM DURASI)
+        # 2. GAMBAR KONTEN
         if should_draw_content:
-            # Masking Content agar tidak keluar dari Frame Rect
+            # Masking agar tidak keluar dari Frame Rect
             path = QPainterPath()
             path.addRect(self.rect())
             painter.setClipPath(path)
             
-            # Placeholder (Kotak abu-abu jika pixmap kosong)
+            # Placeholder Background
             if not self.current_pixmap:
                 painter.setBrush(QColor(40, 40, 40, 255))
                 painter.drawRect(self.rect())
 
-            # Gambar Pixmap (Video/Gambar/Teks)
+            # Gambar Pixmap
             if self.current_pixmap and not self.current_pixmap.isNull():
-                is_text = self.settings.get("content_type") == "text"
-                painter.setOpacity(self.settings.get("opacity", 100) / 100.0)
+                painter.save() # <--- Simpan State
+                try:           
+                    opacity = self.settings.get("opacity", 100) / 100.0
+                    painter.setOpacity(opacity)
 
-                if is_text:
-                    painter.drawPixmap(0, 0, self.current_pixmap)
-                else:
-                    scale = self.settings.get("scale", 100) / 100.0
-                    content_rot = self.settings.get("rot", 0)
-                    
-                    img_w = self.current_pixmap.width()
-                    img_h = self.current_pixmap.height()
-                    
-                    painter.translate(self.rect().center())
-                    painter.rotate(content_rot)
-                    painter.scale(scale, scale)
-                    painter.translate(-img_w/2, -img_h/2)
-                    painter.drawPixmap(0, 0, self.current_pixmap)
-            
-            # Matikan clipping sebelum menggambar UI luar
+                    is_text = self.settings.get("content_type") == "text"
+                    # [BARU] Anggap caption sama seperti text cara gambarnya
+                    is_caption = self.settings.get("content_type") == "caption_preview"
+
+                    if is_text or is_caption:
+                        # Render text/caption pixmap langsung (tanpa transformasi media kompleks)
+                        painter.drawPixmap(self.rect().toRect(), self.current_pixmap)
+                    else:
+                        # --- LOGIKA MEDIA (Video/Image) ---
+                        scale = self.settings.get("scale", 100) / 100.0
+                        content_rot = self.settings.get("rot", 0)
+                        
+                        sf_l = self.settings.get("sf_l", 0)
+                        sf_r = self.settings.get("sf_r", 0)
+                        
+                        f_l = self.settings.get("f_l", 0)
+                        f_r = self.settings.get("f_r", 0)
+                        f_t = self.settings.get("f_t", 0)
+                        f_b = self.settings.get("f_b", 0)
+                        
+                        orig_w = self.current_pixmap.width()
+                        orig_h = self.current_pixmap.height()
+                        
+                        src_x = sf_l
+                        src_y = 0
+                        src_w = max(1, orig_w - sf_l - sf_r)
+                        src_h = orig_h
+                        
+                        # Transformasi
+                        painter.translate(self.rect().center())
+                        painter.rotate(content_rot)
+                        painter.scale(scale, scale)
+                        painter.translate(-src_w / 2, -src_h / 2)
+
+                        # --- LOGIKA FEATHER ---
+                        has_feather = (f_l > 0 or f_r > 0 or f_t > 0 or f_b > 0)
+
+                        if not has_feather:
+                            painter.drawPixmap(0, 0, self.current_pixmap, src_x, src_y, src_w, src_h)
+                        else:
+                            # Render ke Layer Sementara (Temp Pixmap)
+                            temp_pm = QPixmap(src_w, src_h)
+                            temp_pm.fill(Qt.transparent)
+                            
+                            p_temp = QPainter(temp_pm)
+                            try:
+                                # 1. Gambar Video Asli ke Temp
+                                p_temp.drawPixmap(0, 0, self.current_pixmap, src_x, src_y, src_w, src_h)
+                                
+                                # 2. Hapus pinggiran (Feather) pakai DestinationOut
+                                p_temp.setCompositionMode(QPainter.CompositionMode_DestinationOut)
+                                
+                                # -- Kiri --
+                                if f_l > 0:
+                                    grad = QLinearGradient(0, 0, f_l, 0)
+                                    grad.setColorAt(0, QColor(0, 0, 0, 255)) 
+                                    grad.setColorAt(1, QColor(0, 0, 0, 0))
+                                    p_temp.fillRect(0, 0, f_l, src_h, grad)
+                                
+                                # -- Kanan --
+                                if f_r > 0:
+                                    grad = QLinearGradient(src_w - f_r, 0, src_w, 0)
+                                    grad.setColorAt(0, QColor(0, 0, 0, 0))
+                                    grad.setColorAt(1, QColor(0, 0, 0, 255))
+                                    p_temp.fillRect(src_w - f_r, 0, f_r, src_h, grad)
+                                
+                                # -- Atas --
+                                if f_t > 0:
+                                    grad = QLinearGradient(0, 0, 0, f_t)
+                                    grad.setColorAt(0, QColor(0, 0, 0, 255))
+                                    grad.setColorAt(1, QColor(0, 0, 0, 0))
+                                    p_temp.fillRect(0, 0, src_w, f_t, grad)
+                                
+                                # -- Bawah --
+                                if f_b > 0:
+                                    grad = QLinearGradient(0, src_h - f_b, 0, src_h)
+                                    grad.setColorAt(0, QColor(0, 0, 0, 0))
+                                    grad.setColorAt(1, QColor(0, 0, 0, 255))
+                                    p_temp.fillRect(0, src_h - f_b, src_w, f_b, grad)
+                                    
+                            finally:
+                                p_temp.end()
+                            
+                            # 3. Gambar hasil feather ke Main Painter
+                            painter.drawPixmap(0, 0, temp_pm)
+
+                finally:
+                    painter.restore() # Restore state painter utama
+
             painter.setClipping(False)
-
-        # 3. UI OVERLAY & SELECTION (SELALU GAMBAR JIKA SELECTED)
-        # Ini akan menggambar kotak putus-putus meskipun konten tidak digambar (kosong)
-        
+            
+        # 3. UI Helper (Selection, Handles, dll)
         if self.is_drop_target:
-            # Efek Drop Target
             pen = QPen(QColor("#ff9f43"), 4); pen.setJoinStyle(Qt.MiterJoin)
             painter.setPen(pen); painter.setBrush(Qt.NoBrush)
             painter.drawRect(self.rect())
-            painter.setPen(QColor("white")); font = painter.font(); font.setBold(True); font.setPointSize(12)
-            painter.setFont(font); painter.drawText(self.rect(), Qt.AlignCenter, "LEPAS DI SINI")
+            painter.setPen(QColor("white"))
+            painter.drawText(self.rect(), Qt.AlignCenter, "LEPAS DI SINI")
 
         elif is_selected and not self.settings.get("lock", False): 
-            # Gambar Border Putus-putus & Handle Resize
             self._paint_ui_helpers(painter)
-            
-            # [BARU] Tambahkan indikator visual jika layer sedang "Mati" (Di luar durasi)
             if not should_draw_content:
-                # Arsir diagonal tipis agar user tau area frame-nya
                 painter.setBrush(QBrush(QColor(255, 255, 255, 20), Qt.FDiagPattern))
                 painter.setPen(Qt.NoPen)
                 painter.drawRect(self.rect())
-                
-                # Label status
-                painter.setPen(QColor("#ff5555")) # Merah terang
-                painter.drawText(self.rect().topLeft() + QPointF(5, -5), f"OFF (Start: {self.start_time}s)")
+                painter.setPen(QColor("#ff5555"))
+                painter.drawText(self.rect().topLeft() + QPointF(5, -5), "OFF")
 
         painter.restore()
     
-    # --- [CORE FIX] LOGIKA WAKTU (TANPA SETVISIBLE FALSE) ---
+    # --- LOGIKA WAKTU ---
     def set_time_range(self, start, duration=None):
         self.start_time = max(0.0, float(start))
         if duration is not None:
@@ -203,7 +297,7 @@ class VideoItem(QGraphicsRectItem):
             t_local = t_global - self.start_time
             self.seek_to(t_local)
         
-        self.update() # Trigger repaint untuk update visual ghost/normal
+        self.update() # Trigger repaint
         
     # --- KONTEN MEDIA & TEKS ---
     def set_content(self, path):
@@ -213,30 +307,58 @@ class VideoItem(QGraphicsRectItem):
         
         # 1. Cek Tipe File
         if ext in ['.jpg', '.png', '.jpeg', '.webp', '.bmp']:
-            # IMAGE: Default 5 Detik (Bisa diubah user nanti)
+            # IMAGE: Default 5 Detik
             self.current_pixmap = QPixmap(path)
             self.source_duration = 5.0 
         else:
             # VIDEO: Load dan ambil durasi asli
             self._load_as_video(path)
             
-        # 2. [FIX UTAMA] Set durasi layer sesuai file asli
-        # Jika source_duration 0 (gagal), fallback ke 5.0
+        # 2. Set durasi layer sesuai file asli
         final_dur = self.source_duration if self.source_duration > 0 else 5.0
         self.set_time_range(self.start_time, final_dur)
           
         self.update()
 
     def set_text_content(self, text, is_paragraph=False):
+        text_defaults = {
+            "content_type": "text",
+            "text_content": text,
+            "is_paragraph": is_paragraph,
+            # Style Defaults
+            "font": "Segoe UI",
+            "font_size": 40,
+            "text_color": "#ffffff",
+            "alignment": "center",
+            "line_spacing": 100,
+            "bg_on": False,
+            "bg_color": "#000000",
+            "stroke_on": False,
+            "stroke_width": 0,
+            "stroke_color": "#000000",
+            "shadow_on": False,
+            "shadow_color": "#000000"
+        }
+        
+        # Masukkan default jika key belum ada
+        for k, v in text_defaults.items():
+            if k not in self.settings:
+                self.settings[k] = v
+
+        # Update konten utama
         self.settings.update({
-            "content_type": "text", "text_content": text, "is_paragraph": is_paragraph
+            "content_type": "text", 
+            "text_content": text, 
+            "is_paragraph": is_paragraph
         })
+        
         # Text default duration 5s
         self.set_time_range(self.start_time, 5.0)
         self.refresh_text_render()
 
+
     def refresh_text_render(self):
-        """Me-render teks menjadi QPixmap agar performa preview lancar"""
+        """Me-render teks visual caption ke dalam self.current_pixmap"""
         s = self.settings
         w, h = max(1, int(self.rect().width())), max(1, int(self.rect().height()))
         
@@ -246,42 +368,81 @@ class VideoItem(QGraphicsRectItem):
         p = QPainter(canvas)
         p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
         
-        if s["bg_on"]:
-            p.setBrush(QColor(s["bg_color"])); p.setPen(Qt.NoPen)
-            p.drawRect(0, 0, w, h)
+        # 1. Background Box
+        if s.get("bg_on", False):
+            bg_col = QColor(s.get("bg_color", "#000000"))
+            bg_col.setAlpha(s.get("bg_opacity", 255))
+            p.setBrush(bg_col)
+            p.setPen(Qt.NoPen)
+            radius = s.get("bg_rounded", 0)
+            p.drawRoundedRect(0, 0, w, h, radius, radius)
             
-        font = QFont(s["font"], s["font_size"])
+        # 2. Font & Text Setup
+        font_family = s.get("font", "Arial")
+        # Jika font datang sebagai string "PySide6.QtGui.QFont(...)", ambil family-nya saja jika perlu
+        # tapi biasanya combobox mengembalikan string nama font.
+        
+        font = QFont(font_family, s.get("font_size", 40))
+        
+        # Handle Font Weight/Style dari Template
+        weight = s.get("font_weight", "Normal")
+        if weight == "Bold": font.setBold(True)
+        elif weight == "Black": font.setWeight(QFont.Black)
+        elif weight == "Light": font.setWeight(QFont.Light)
+        
+        font.setLetterSpacing(QFont.AbsoluteSpacing, s.get("letter_spacing", 0))
         p.setFont(font)
         
-        if s["is_paragraph"]:
-            p.setPen(QColor(s["text_color"]))
-            opt = QTextOption(Qt.AlignCenter if s["alignment"] == "center" else Qt.AlignLeft)
-            opt.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
-            p.drawText(QRectF(10, 10, w-20, h-20), s["text_content"], opt)
-        else:
-            # Render Teks Judul dengan Stroke jika aktif
-            fm = QFontMetrics(font)
+        txt = s.get("text_content", "SAMPLE CAPTION")
+
+        # 3. Shadow Effect
+        if s.get("shadow_on", False):
+            p.setPen(QColor(0, 0, 0, 150))
+            # Offset shadow sedikit
+            p.drawText(QRectF(4, 4, w, h), Qt.AlignCenter, txt)
+
+        # 4. Main Text rendering (Stroke / Fill)
+        if s.get("stroke_on", False):
             path = QPainterPath()
-            tw, th = fm.horizontalAdvance(s["text_content"]), fm.capHeight()
-            path.addText((w - tw)/2, (h + th)/2, font, s["text_content"])
+            fm = QFontMetrics(font)
+            # Hitung posisi tengah manual untuk path
+            tw = fm.horizontalAdvance(txt)
+            th = fm.capHeight()
+            x_pos = (w - tw) / 2
+            y_pos = (h + th) / 2
             
-            if s.get("stroke_on"):
-                pen = QPen(QColor(s["stroke_color"]), s["stroke_width"])
-                p.setPen(pen); p.drawPath(path)
+            path.addText(x_pos, y_pos, font, txt)
             
-            p.fillPath(path, QColor(s["text_color"]))
+            # Gambar Stroke
+            stroke_w = s.get("stroke_width", 2)
+            p.setPen(QPen(QColor(s.get("stroke_color", "black")), stroke_w))
+            p.drawPath(path)
+            
+            # Gambar Fill (Highlight warna jika karaoke)
+            fill_col = QColor(s.get("highlight_c", s.get("text_color", "white")))
+            p.fillPath(path, fill_col)
+        else:
+            # Render teks biasa
+            p.setPen(QColor(s.get("text_color", "#ffffff")))
+            p.drawText(QRectF(0, 0, w, h), Qt.AlignCenter, txt)
+        
+        # 5. Visual Guide (Dotted Line) khusus Mode Caption Preview
+        if s.get("content_type") == "caption_preview":
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor("#61afef"), 1, Qt.DashLine))
+            p.drawRect(0, 0, w-1, h-1)
         
         p.end()
+        
+        # FIX: Assign ke self.current_pixmap agar method paint() bisa menggambarnya
         self.current_pixmap = QPixmap.fromImage(canvas)
-        self.update()
+        self.update() # Memicu repaint ulang di layar
 
     # --- VIDEO ENGINE BRIDGE ---
     def _load_as_video(self, path):
         if PyAVClip:
             try:
                 self.clip = PyAVClip(path)
-                # [FIX BUG] Gunakan variable yg konsisten (source_duration)
-                # Sebelumnya pakai duration_s yg tidak dibaca set_content
                 self.source_duration = getattr(self.clip, 'duration', 0.0) 
                 self.seek_to(0)
                 print(f"[VIDEO LOAD] Duration detected: {self.source_duration}s")
@@ -290,13 +451,8 @@ class VideoItem(QGraphicsRectItem):
                 self.source_duration = 0.0
 
     def seek_to(self, t):
-        # [MODIFIKASI] Cek batas durasi sumber (Looping atau Stop)
-        # Di sini kita pakai logika CLAMP (tahan di frame terakhir jika lewat)
         if self.clip:
-            # Pastikan t tidak negatif
             t = max(0, t)
-            # Opsional: Jika ingin looping video di dalam layer: t = t % self.source_duration
-            
             f = self.clip.get_frame_at(t)
             if f is not None:
                 img = QImage(f.data, f.shape[1], f.shape[0], f.shape[2]*f.shape[1], QImage.Format_RGB888)
@@ -304,18 +460,15 @@ class VideoItem(QGraphicsRectItem):
                 self.update()
 
     def _paint_ui_helpers(self, painter):
-        # Garis Border Dash
         r = self.rect()
         painter.setPen(QPen(QColor("#4cc9f0"), 1, Qt.DashLine))
         painter.drawRect(r)
         
-        # Handle Kanan Bawah
         s = self.HANDLE_SIZE
         painter.setBrush(QColor("white"))
         painter.setPen(QPen(Qt.black, 1))
         painter.drawRect(r.right() - s/2, r.bottom() - s/2, s, s)
         
-        # Label Nama Frame
         painter.setBrush(QColor("#4cc9f0"))
         painter.drawRect(0, -20, r.width(), 20)
         painter.setPen(Qt.black)
@@ -324,11 +477,10 @@ class VideoItem(QGraphicsRectItem):
     def set_drop_highlight(self, active):
         if self.is_drop_target != active:
             self.is_drop_target = active
-            self.update() # Trigger repaint
+            self.update()
             
     # --- INTERAKSI MOUSE (RESIZING) ---
     def _get_handle_at(self, pos):
-        """Cek apakah mouse berada di atas handle resize (kanan bawah)"""
         r = self.rect()
         s = self.HANDLE_SIZE
         if QRectF(r.right() - s/2, r.bottom() - s/2, s, s).contains(pos):
@@ -354,155 +506,235 @@ class VideoItem(QGraphicsRectItem):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self.is_resizing:
-            diff = self.mapFromScene(event.scenePos()) - self.mapFromScene(self.resize_start_pos)
-            new_w = max(50, self.resize_start_rect.width() + diff.x())
-            new_h = max(50, self.resize_start_rect.height() + diff.y())
+        if self.settings.get("lock", False): event.ignore(); return
+        if self._is_dragging:
+            delta = event.scenePos() - event.lastScenePos()
+            self.settings["x"] += delta.x()
+            self.settings["y"] += delta.y()
+            self._sync_visuals()
             
-            self.prepareGeometryChange()
-            self.setRect(0, 0, new_w, new_h)
-            self.settings["frame_w"], self.settings["frame_h"] = int(new_w), int(new_h)
-            
-            if self.settings.get("is_paragraph"): 
-                self.refresh_text_render()
-            
-            self.setTransformOriginPoint(self.rect().center())
-            self.update()
+            # [PENTING] Paksa scene memancarkan sinyal 'changed' agar controller mengupdate spinbox
+            self.scene().update() 
+            event.accept()
         else:
             super().mouseMoveEvent(event)
 
-    # [FIX] Perbaikan Logic Mouse Release
     def mouseReleaseEvent(self, event):
         self.is_resizing = False
-        
-        # HANYA aktifkan kembali Movable JIKA item TIDAK dikunci
         is_locked = self.settings.get("lock", False)
         if not is_locked:
             self.setFlag(QGraphicsItem.ItemIsMovable, True)
-            
         super().mouseReleaseEvent(event)
+        
 
-# --- CLASS BACKGROUND (VIGNETTE FIXED ON CANVAS) ---
+# --- Helper Class untuk Signal ---
+class ItemSignals(QObject):
+    sig_moved = Signal(dict)
+
+
 class BackgroundItem(VideoItem):
-    """
-    Spesialisasi VideoItem untuk latar belakang.
-    Fitur:
-    - Auto Center
-    - Fit Mode: 'cover' (Zoom Center)
-    - Vignette STATIC (Tidak ikut geser saat BG digeser)
-    - Sinkronisasi Drag & Typing Coordinate
-    """
     def __init__(self, path, scene_rect):
+        # Gunakan inisialisasi asli agar struktur Container & ZValue tetap benar
         super().__init__("BG", path, None)
-        self.setZValue(-500) 
+        self.setZValue(-500)
+        self._is_dragging = False # Variable khusus class ini
+        
+        # --- INIT SIGNAL (DARI PATCH) ---
+        self.signals = ItemSignals()
         
         self.scene_w = scene_rect.width()
         self.scene_h = scene_rect.height()
         
+        # --- 1. VISUAL SETUP (Container Logic) ---
+        self.container = QGraphicsRectItem(self)
+        self.container.setRect(0, 0, self.scene_w, self.scene_h)
+        self.container.setPen(Qt.NoPen)
+        self.container.setFlag(QGraphicsItem.ItemClipsChildrenToShape, True)
+
+        # Blur pada container
         self.blur_effect = QGraphicsBlurEffect()
-        self.setGraphicsEffect(self.blur_effect)
+        self.container.setGraphicsEffect(self.blur_effect)
+        self.blur_effect.setEnabled(False)
+
+        # Gambar Konten
+        self.pixmap_item = QGraphicsPixmapItem(self.container)
+        self.pixmap_item.setTransformationMode(Qt.SmoothTransformation)
+
+        # Vignette Overlay
+        self.vignette_item = QGraphicsRectItem(self)
+        self.vignette_item.setRect(0, 0, self.scene_w, self.scene_h)
+        self.vignette_item.setPen(Qt.NoPen)
+        self.vignette_item.setZValue(10)
+        self.vignette_item.setVisible(False)
+        self.vignette_item.setAcceptedMouseButtons(Qt.NoButton)
+
+        # --- 2. SETTINGS ---
+        self.setFlag(QGraphicsItem.ItemIsMovable, False)
+        self.setAcceptHoverEvents(True)
         
-        # Default Settings
         self.settings.update({
-            "blur": 0, "vig": 0, "is_bg": True, 
+            "is_bg": True,
             "scale": 100, "x": 0, "y": 0, 
             "fit": "cover",
-            "lock": False
+            "lock": False,
+            "blur": 0,
+            
+            # --- VIGNETTE PARAMETERS ---
+            "vig_strength": 0.0,
+            "vig_radius": 0.8,
+            "vig_angle": 0.0
         })
         
-        self.blur_effect.setEnabled(False)
+        self._is_dragging = False
+        
+        if path: self.set_content(path)
         self.set_time_range(0, None)
+        self._apply_lock_state()
+
+    # --- CORE: ANTI LONCAT ---
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionChange:
+            return QPointF(0, 0)
+        return super(VideoItem, self).itemChange(change, value)
+
+    def _get_handle_at(self, pos):
+        return self.Handles["NONE"]
+
+    def boundingRect(self):
+        return QRectF(-50000, -50000, 100000, 100000)
+
+    def paint(self, painter, option, widget):
+        pass
 
     def set_scene_size(self, w, h):
         self.scene_w = w
         self.scene_h = h
-        self.update()
+        self.container.setRect(0, 0, w, h)
+        self.vignette_item.setRect(0, 0, w, h)
+        self._sync_visuals()
 
-    # Di dalam class BackgroundItem
     def set_content(self, path):
         super().set_content(path)
-        self.setPos(0, 0) 
-        # Simpan state awal x,y = 0 di settings
         self.settings.update({"x": 0, "y": 0, "scale": 100, "fit": "cover"})
-        self.update()
+        if self.current_pixmap:
+            self.pixmap_item.setPixmap(self.current_pixmap)
+            w, h = self.current_pixmap.width(), self.current_pixmap.height()
+            self.pixmap_item.setOffset(-w/2, -h/2)
+        self._sync_visuals()
 
     def update_bg_settings(self, data):
+        if "vig" in data and "vig_strength" not in data:
+            data["vig_strength"] = float(data["vig"]) / 100.0
+
         self.settings.update(data)
-        
-        # [FIX] Update Flag Movable Sesuai Status Lock
         if "lock" in data:
-            is_locked = data["lock"]
-            # Jika dikunci, matikan fitur Movable
-            self.setFlag(QGraphicsItem.ItemIsMovable, not is_locked)
-        
-        if "x" in data or "y" in data:
-            self.setPos(data.get("x", 0), data.get("y", 0))
-            
-        self.update()
+            self._apply_lock_state()
+        self._sync_visuals()
 
-    def paint(self, painter, option, widget):
-        if not self.current_pixmap: 
-            painter.fillRect(self.boundingRect(), Qt.black)
-            return
-        
-        painter.save()
+    def _apply_lock_state(self):
+        is_locked = self.settings.get("lock", False)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, not is_locked)
+        self.setCursor(Qt.ArrowCursor if is_locked else Qt.OpenHandCursor)
+
+    def _sync_visuals(self):
+        if not self.current_pixmap: return
         s = self.settings
-        
         cw, ch = self.scene_w, self.scene_h
-        pw, ph = self.current_pixmap.width(), self.current_pixmap.height()
         
-        # Ambil posisi fisik item saat ini (karena drag / setPos)
-        curr_x = self.pos().x()
-        curr_y = self.pos().y()
-
-        # --- 1. GAMBAR KONTEN (IMAGE) ---
-        # Logic Scale
+        # 1. POSISI & SKALA (LOGIKA STABIL)
+        pw, ph = self.current_pixmap.width(), self.current_pixmap.height()
         base_scale = 1.0
         if pw > 0 and ph > 0:
             scale_w = cw / pw
             scale_h = ch / ph
-            fit_mode = s.get("fit", "cover")
-            if fit_mode == "contain": base_scale = min(scale_w, scale_h)
-            else: base_scale = max(scale_w, scale_h)
+            base_scale = max(scale_w, scale_h) if s.get("fit") == "cover" else min(scale_w, scale_h)
+        
+        final_scale = base_scale * (s.get("scale", 100) / 100.0)
+        
+        # Penempatan absolut di tengah canvas + offset user
+        self.pixmap_item.setScale(final_scale)
+        self.pixmap_item.setPos(cw / 2 + s.get("x", 0), ch / 2 + s.get("y", 0))
 
-        final_scale = base_scale * (s["scale"] / 100.0)
-        
-        # Logic Transform
-        # Kita HAPUS 'painter.translate(s["x"], s["y"])' manual
-        # Karena posisi sudah ditangani oleh sistem Qt via self.pos()
-        
-        # Pindah ke Tengah Canvas (Relative terhadap Item Origin)
-        painter.translate(cw / 2, ch / 2)
-        
-        # Scale
-        painter.scale(final_scale, final_scale)
-        
-        # Geser Pivot Image ke Tengah
-        painter.translate(-pw / 2, -ph / 2)
-        
-        # Draw Image
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)
-        painter.drawPixmap(0, 0, self.current_pixmap)
-        
-        painter.restore() # Restore ke koordinat item lokal (0,0 = item pos)
+        # 2. VIGNETTE (UPDATE PARAMETER)
+        strength = float(s.get("vig_strength", 0.0))
+        if strength > 0.001:
+            self.vignette_item.setVisible(True)
+            radius_param = float(s.get("vig_radius", 0.8)) # 0.2 - 1.2
+            angle_deg = float(s.get("vig_angle", 0.0))    # 0 - 360
+            
+            max_dim = max(cw, ch)
+            grad_radius = max_dim * radius_param
+            
+            # Hitung titik fokus berdasarkan angle
+            angle_rad = math.radians(angle_deg)
+            offset_dist = max_dim * 0.4 
+            focal_x = (cw / 2) + math.cos(angle_rad) * offset_dist
+            focal_y = (ch / 2) + math.sin(angle_rad) * offset_dist
+            
+            grad = QRadialGradient(cw / 2, ch / 2, grad_radius, focal_x, focal_y)
+            
+            softness_val = 0.4 * max_dim
+            start_fade_pos = (grad_radius - softness_val) / grad_radius
+            start_fade_pos = max(0.0, min(0.99, start_fade_pos))
+            
+            color_dark = QColor(0, 0, 0, int(strength * 255))
+            color_clear = QColor(0, 0, 0, 0)
+            
+            grad.setColorAt(0.0, color_clear)
+            grad.setColorAt(start_fade_pos, color_clear)
+            grad.setColorAt(1.0, color_dark)
+            grad.setSpread(QRadialGradient.PadSpread)
+            
+            self.vignette_item.setBrush(QBrush(grad))
+        else:
+            self.vignette_item.setVisible(False)
 
-        # --- 2. VIGNETTE (STATIC ON CANVAS) ---
-        if s.get("vig", 0) > 0:
-            vig_strength = int(s["vig"] * 2.55)
-            radius = max(cw, ch) / 1.2
-            
-            grad = QRadialGradient(cw / 2, ch / 2, radius)
-            grad.setColorAt(0, QColor(0, 0, 0, 0))
-            grad.setColorAt(1, QColor(0, 0, 0, vig_strength))
-            
-            # --- TEKNIK PENTING: KOMPENSASI POSISI ---
-            # Kita 'mundurkan' painter sejauh posisi item saat ini.
-            # Jadi (0,0) painter kembali pas di (0,0) Scene/Layar.
-            painter.save()
-            painter.translate(-curr_x, -curr_y) 
-            
-            painter.fillRect(0, 0, int(cw), int(ch), QBrush(grad))
-            painter.restore()
+        # 3. Blur
+        b = s.get("blur", 0)
+        if b > 0 and not self._is_dragging:
+            if self.blur_effect.blurRadius() != b:
+                self.blur_effect.setBlurRadius(b)
+            self.blur_effect.setEnabled(True)
+        else:
+            self.blur_effect.setEnabled(False)
 
-    def boundingRect(self):
-        return QRectF(-5000, -5000, 10000, 10000)
+    # --- HANDLERS BG ---
+    def mousePressEvent(self, event):
+        if self.settings.get("lock", False): event.ignore(); return
+        self._is_dragging = True
+        self.setCursor(Qt.ClosedHandCursor)
+        self.blur_effect.setEnabled(False)
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.settings.get("lock", False): event.ignore(); return
+        
+        if self._is_dragging:
+            # 1. Hitung Delta
+            delta = event.scenePos() - event.lastScenePos()
+            self.settings["x"] += delta.x()
+            self.settings["y"] += delta.y()
+            
+            # 2. Update Visual
+            self._sync_visuals()
+            
+            # 3. [PATCHED] Kirim Sinyal ke Panel agar Angka ikut berubah
+            data = self.settings.copy()
+            # Pastikan flag identitas item terbawa
+            data["is_bg"] = True 
+            self.signals.sig_moved.emit(data)
+
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.settings.get("lock", False): event.ignore(); return
+        self._is_dragging = False
+        self.setCursor(Qt.OpenHandCursor)
+        self._sync_visuals() # Re-enable blur if needed
+        
+        if self.isSelected():
+            self.setSelected(False)
+            self.setSelected(True)
+        super().mouseReleaseEvent(event)
